@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM_NAME="$(basename "$0")"
+DEFAULT_ROOT="${CODEX_MULTI_ENV_ROOT:-$HOME/.codex-multi-env}"
+DEFAULT_SEED_FROM="${CODEX_MULTI_ENV_SEED_FROM:-$HOME/.codex}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codex-env init <name> [--seed] [--seed-from <dir>]
+  codex-env shell <name> [--cd <dir>]
+  codex-env exec <name> [--cd <dir>] [--sandbox <mode>] -- <prompt>
+  codex-env status <name>
+  codex-env list
+  codex-env doctor
+
+Environment:
+  CODEX_MULTI_ENV_ROOT       Root directory for envs. Default: ~/.codex-multi-env
+  CODEX_MULTI_ENV_SEED_FROM  Default seed CODEX_HOME. Default: ~/.codex
+  CODEX_BIN                  Codex CLI path. Default: first codex on PATH
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+find_codex_bin() {
+  if [[ -n "${CODEX_BIN:-}" ]]; then
+    printf '%s\n' "$CODEX_BIN"
+    return 0
+  fi
+  command -v codex || true
+}
+
+require_codex_bin() {
+  local codex_bin
+  codex_bin="$(find_codex_bin)"
+  [[ -n "$codex_bin" ]] || die "codex binary not found; install Codex CLI or set CODEX_BIN=/path/to/codex"
+  [[ -x "$codex_bin" ]] || die "codex binary is not executable: $codex_bin"
+  printf '%s\n' "$codex_bin"
+}
+
+print_codex_check() {
+  local codex_bin
+  codex_bin="$(find_codex_bin)"
+  if [[ -z "$codex_bin" ]]; then
+    printf 'codex: not found\n'
+    return 1
+  fi
+  if [[ ! -x "$codex_bin" ]]; then
+    printf 'codex: found but not executable: %s\n' "$codex_bin"
+    return 1
+  fi
+  printf 'codex: %s\n' "$codex_bin"
+  if "$codex_bin" --version >/dev/null 2>&1; then
+    printf 'codex_version: %s\n' "$("$codex_bin" --version 2>/dev/null | head -n 1)"
+  else
+    printf 'codex_version: unavailable\n'
+    return 1
+  fi
+}
+
+require_name() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "environment name is required"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid environment name: $name"
+}
+
+env_dir() {
+  local name="$1"
+  printf '%s/envs/%s' "$DEFAULT_ROOT" "$name"
+}
+
+codex_home_for() {
+  local name="$1"
+  printf '%s/codex-home' "$(env_dir "$name")"
+}
+
+tmp_dir_for() {
+  local name="$1"
+  printf '%s/tmp' "$(env_dir "$name")"
+}
+
+copy_if_missing() {
+  local src="$1"
+  local dst="$2"
+  [[ -e "$src" ]] || return 0
+  [[ ! -e "$dst" ]] || return 0
+  mkdir -p "$(dirname "$dst")"
+  cp -p "$src" "$dst"
+}
+
+seed_codex_home() {
+  local seed_from="$1"
+  local target="$2"
+  [[ -d "$seed_from" ]] || die "seed directory does not exist: $seed_from"
+
+  copy_if_missing "$seed_from/auth.json" "$target/auth.json"
+  copy_if_missing "$seed_from/config.toml" "$target/config.toml"
+  copy_if_missing "$seed_from/version.json" "$target/version.json"
+  copy_if_missing "$seed_from/installation_id" "$target/installation_id"
+}
+
+ensure_env() {
+  local name="$1"
+  require_name "$name"
+  mkdir -p "$(codex_home_for "$name")" "$(tmp_dir_for "$name")"
+}
+
+print_exports() {
+  local name="$1"
+  local codex_home tmp_dir
+  codex_home="$(codex_home_for "$name")"
+  tmp_dir="$(tmp_dir_for "$name")"
+  printf 'export CODEX_HOME=%q\n' "$codex_home"
+  printf 'export TMPDIR=%q\n' "$tmp_dir"
+  printf 'export TMP=%q\n' "$tmp_dir"
+  printf 'export TEMP=%q\n' "$tmp_dir"
+}
+
+cmd_init() {
+  local name="${1:-}"
+  require_name "$name"
+  shift || true
+
+  local seed="no"
+  local seed_from="$DEFAULT_SEED_FROM"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --seed)
+        seed="yes"
+        shift
+        ;;
+      --seed-from)
+        seed="yes"
+        seed_from="${2:-}"
+        [[ -n "$seed_from" ]] || die "--seed-from requires a directory"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown init option: $1"
+        ;;
+    esac
+  done
+
+  ensure_env "$name"
+  if [[ "$seed" == "yes" ]]; then
+    seed_codex_home "$seed_from" "$(codex_home_for "$name")"
+    printf 'seeded_from: %s\n' "$seed_from"
+    printf 'warning: --seed copies existing Codex auth/config state. If the source Codex home is logged out or misconfigured, this environment may inherit that state.\n'
+  fi
+
+  printf 'created environment: %s\n' "$name"
+  printf 'codex_home: %s\n' "$(codex_home_for "$name")"
+  printf 'tmp: %s\n' "$(tmp_dir_for "$name")"
+}
+
+cmd_shell() {
+  local name="${1:-}"
+  require_name "$name"
+  shift || true
+
+  local cwd=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cd)
+        cwd="${2:-}"
+        [[ -n "$cwd" ]] || die "--cd requires a directory"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown shell option: $1"
+        ;;
+    esac
+  done
+
+  ensure_env "$name"
+  export CODEX_HOME
+  export TMPDIR TMP TEMP
+  CODEX_HOME="$(codex_home_for "$name")"
+  TMPDIR="$(tmp_dir_for "$name")"
+  TMP="$TMPDIR"
+  TEMP="$TMPDIR"
+
+  if [[ -n "$cwd" ]]; then
+    cd "$cwd"
+  fi
+
+  printf 'Entering codex environment: %s\n' "$name"
+  printf 'CODEX_HOME=%s\n' "$CODEX_HOME"
+  printf 'TMPDIR=%s\n' "$TMPDIR"
+  if ! print_codex_check >/dev/null; then
+    printf 'warning: codex binary not found or not runnable in this terminal. Install Codex CLI or set CODEX_BIN before running codex.\n' >&2
+  fi
+  exec "${SHELL:-/bin/bash}"
+}
+
+cmd_exec() {
+  local name="${1:-}"
+  require_name "$name"
+  shift || true
+
+  local cwd=""
+  local sandbox="${CODEX_SANDBOX:-read-only}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cd)
+        cwd="${2:-}"
+        [[ -n "$cwd" ]] || die "--cd requires a directory"
+        shift 2
+        ;;
+      --sandbox)
+        sandbox="${2:-}"
+        [[ -n "$sandbox" ]] || die "--sandbox requires a value"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown exec option before --: $1"
+        ;;
+    esac
+  done
+
+  [[ $# -gt 0 ]] || die "exec requires a prompt after --"
+  ensure_env "$name"
+
+  local codex_bin
+  codex_bin="$(require_codex_bin)"
+
+  export CODEX_HOME
+  export TMPDIR TMP TEMP
+  CODEX_HOME="$(codex_home_for "$name")"
+  TMPDIR="$(tmp_dir_for "$name")"
+  TMP="$TMPDIR"
+  TEMP="$TMPDIR"
+
+  local args=("exec" "--sandbox" "$sandbox" "--color" "never")
+  if [[ -n "$cwd" ]]; then
+    args+=("--cd" "$cwd")
+  fi
+  args+=("$*")
+
+  exec "$codex_bin" "${args[@]}"
+}
+
+cmd_status() {
+  local name="${1:-}"
+  require_name "$name"
+  local home_dir tmp_dir
+  home_dir="$(codex_home_for "$name")"
+  tmp_dir="$(tmp_dir_for "$name")"
+  printf 'name: %s\n' "$name"
+  printf 'root: %s\n' "$(env_dir "$name")"
+  printf 'codex_home: %s\n' "$home_dir"
+  printf 'tmp: %s\n' "$tmp_dir"
+  printf 'auth_json: %s\n' "$([[ -f "$home_dir/auth.json" ]] && echo yes || echo no)"
+  printf 'config_toml: %s\n' "$([[ -f "$home_dir/config.toml" ]] && echo yes || echo no)"
+  printf 'exports:\n'
+  print_exports "$name" | sed 's/^/  /'
+}
+
+cmd_list() {
+  local envs_root="$DEFAULT_ROOT/envs"
+  [[ -d "$envs_root" ]] || return 0
+  find "$envs_root" -mindepth 1 -maxdepth 1 -type d -print | sort | while IFS= read -r dir; do
+    basename "$dir"
+  done
+}
+
+cmd_doctor() {
+  local ok="yes"
+  printf 'program: %s\n' "$PROGRAM_NAME"
+  printf 'root: %s\n' "$DEFAULT_ROOT"
+  printf 'default_seed_from: %s\n' "$DEFAULT_SEED_FROM"
+
+  if print_codex_check; then
+    :
+  else
+    ok="no"
+  fi
+
+  if mkdir -p "$DEFAULT_ROOT/envs" "$DEFAULT_ROOT/.doctor-write-test" 2>/dev/null; then
+    rmdir "$DEFAULT_ROOT/.doctor-write-test" 2>/dev/null || true
+    printf 'root_writable: yes\n'
+  else
+    printf 'root_writable: no\n'
+    ok="no"
+  fi
+
+  if [[ -d "$DEFAULT_SEED_FROM" ]]; then
+    printf 'default_seed_exists: yes\n'
+  else
+    printf 'default_seed_exists: no\n'
+  fi
+
+  [[ "$ok" == "yes" ]] || return 1
+}
+
+main() {
+  local command="${1:-}"
+  case "$command" in
+    init)
+      shift
+      cmd_init "$@"
+      ;;
+    shell)
+      shift
+      cmd_shell "$@"
+      ;;
+    exec)
+      shift
+      cmd_exec "$@"
+      ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    list)
+      shift
+      cmd_list "$@"
+      ;;
+    doctor|check)
+      shift
+      cmd_doctor "$@"
+      ;;
+    -h|--help|"")
+      usage
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"
